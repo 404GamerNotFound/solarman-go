@@ -28,13 +28,27 @@ type Client struct {
 	address string
 	serial  uint32
 	timeout time.Duration
+	log     Logger
 
 	mu       sync.Mutex
 	sequence uint8
 }
 
+// Logger logs Solarman V5 transport messages.
+type Logger func(format string, args ...any)
+
+// Option configures a Client.
+type Option func(*Client)
+
+// WithLogger configures logging for Solarman V5 transport messages.
+func WithLogger(log Logger) Option {
+	return func(client *Client) {
+		client.log = log
+	}
+}
+
 // New creates a Solarman V5 client.
-func New(host string, port int, serial uint32, timeout time.Duration) (*Client, error) {
+func New(host string, port int, serial uint32, timeout time.Duration, options ...Option) (*Client, error) {
 	if host == "" {
 		return nil, errors.New("missing host")
 	}
@@ -50,12 +64,17 @@ func New(host string, port int, serial uint32, timeout time.Duration) (*Client, 
 		sequence[0] = sequence[0]%254 + 1
 	}
 
-	return &Client{
+	client := &Client{
 		address:  net.JoinHostPort(host, strconv.Itoa(port)),
 		serial:   serial,
 		timeout:  timeout,
 		sequence: sequence[0],
-	}, nil
+	}
+	for _, option := range options {
+		option(client)
+	}
+
+	return client, nil
 }
 
 // ReadHoldingRegisters reads holding registers from the connected inverter.
@@ -97,7 +116,9 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 	sequence := c.sequence
 	c.sequence++
 
-	if _, err := conn.Write(request(c.serial, sequence, id, function, address, count)); err != nil {
+	request := request(c.serial, sequence, id, function, address, count)
+	c.logf("send %s: %x", c.address, request)
+	if _, err := conn.Write(request); err != nil {
 		return nil, fmt.Errorf("write request: %w", err)
 	}
 
@@ -106,6 +127,7 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 		if err != nil {
 			return nil, fmt.Errorf("read response: %w", err)
 		}
+		c.logf("recv %s: %x", c.address, frame)
 		if frame[5] != sequence {
 			continue
 		}
@@ -116,6 +138,12 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 		}
 
 		return validateModbusResponse(response, id, function, count)
+	}
+}
+
+func (c *Client) logf(format string, args ...any) {
+	if c.log != nil {
+		c.log(format, args...)
 	}
 }
 

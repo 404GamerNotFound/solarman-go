@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -62,7 +64,10 @@ func TestReadHoldingRegisters(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	client, err := New(host, portNumber, serial, time.Second)
+	var messages []string
+	client, err := New(host, portNumber, serial, time.Second, WithLogger(func(format string, args ...any) {
+		messages = append(messages, fmt.Sprintf(format, args...))
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,6 +81,9 @@ func TestReadHoldingRegisters(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+	if len(messages) != 3 || !strings.HasPrefix(messages[0], "send ") || !strings.HasPrefix(messages[1], "recv ") || !strings.HasPrefix(messages[2], "recv ") {
+		t.Fatalf("unexpected log messages: %v", messages)
 	}
 }
 
