@@ -1,6 +1,6 @@
-# solaman-go
+# solarman-go
 
-`solaman-go` is a Go client for the Solarman V5 protocol used by compatible WiFi data loggers.
+`solarman-go` is a Go client for the Solarman V5 protocol used by compatible WiFi data loggers.
 It sends Modbus RTU read requests through the logger's local TCP interface, normally port 8899.
 
 The module only implements the generic transport. Inverter-specific register maps and value decoding belong to its consumers.

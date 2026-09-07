@@ -1,3 +1,3 @@
-module github.com/404GamerNotFound/solaman-go
+module github.com/404GamerNotFound/solarman-go
 
 go 1.27.0
