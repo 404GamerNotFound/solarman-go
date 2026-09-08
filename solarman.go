@@ -31,6 +31,7 @@ type Client struct {
 	log     Logger
 
 	mu       sync.Mutex
+	conn     net.Conn
 	sequence uint8
 }
 
@@ -98,19 +99,56 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	conn, reused, err := c.connection(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := c.read(ctx, conn, id, function, address, count)
+	if err == nil {
+		return response, err
+	}
+
+	var transportErr *transportError
+	if !errors.As(err, &transportErr) {
+		return nil, err
+	}
+
+	_ = c.close()
+	if !reused {
+		return nil, err
+	}
+
+	conn, _, err = c.connection(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return c.read(ctx, conn, id, function, address, count)
+}
+
+func (c *Client) connection(ctx context.Context) (net.Conn, bool, error) {
+	if c.conn != nil {
+		return c.conn, true, nil
+	}
+
 	dialer := net.Dialer{Timeout: c.timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", c.address)
 	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", c.address, err)
+		return nil, false, fmt.Errorf("dial %s: %w", c.address, err)
 	}
-	defer conn.Close()
+	c.conn = conn
 
+	return conn, false, nil
+}
+
+func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, address, count uint16) ([]byte, error) {
 	deadline := time.Now().Add(c.timeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
 	}
 	if err := conn.SetDeadline(deadline); err != nil {
-		return nil, fmt.Errorf("set deadline: %w", err)
+		return nil, &transportError{err: fmt.Errorf("set deadline: %w", err)}
 	}
 
 	sequence := c.sequence
@@ -119,13 +157,13 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 	request := request(c.serial, sequence, id, function, address, count)
 	c.logf("send %s: %x", c.address, request)
 	if _, err := conn.Write(request); err != nil {
-		return nil, fmt.Errorf("write request: %w", err)
+		return nil, &transportError{err: fmt.Errorf("write request: %w", err)}
 	}
 
 	for {
 		frame, err := readFrame(conn)
 		if err != nil {
-			return nil, fmt.Errorf("read response: %w", err)
+			return nil, &transportError{err: fmt.Errorf("read response: %w", err)}
 		}
 		c.logf("recv %s: %x", c.address, frame)
 		if frame[5] != sequence {
@@ -139,6 +177,37 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 
 		return validateModbusResponse(response, id, function, count)
 	}
+}
+
+// Close releases the TCP connection.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.close()
+}
+
+func (c *Client) close() error {
+	if c.conn == nil {
+		return nil
+	}
+
+	err := c.conn.Close()
+	c.conn = nil
+
+	return err
+}
+
+type transportError struct {
+	err error
+}
+
+func (e *transportError) Error() string {
+	return e.err.Error()
+}
+
+func (e *transportError) Unwrap() error {
+	return e.err
 }
 
 func (c *Client) logf(format string, args ...any) {

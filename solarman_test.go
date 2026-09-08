@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestReadHoldingRegisters(t *testing.T) {
+func TestReadHoldingRegistersReusesConnection(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -28,31 +28,38 @@ func TestReadHoldingRegisters(t *testing.T) {
 		}
 		defer conn.Close()
 
-		frame, err := readFrame(conn)
-		if err != nil {
-			done <- err
-			return
-		}
-		if got := binary.LittleEndian.Uint32(frame[7:11]); got != serial {
-			done <- errors.New("request has wrong logger serial")
-			return
-		}
-		modbus := frame[26 : len(frame)-2]
-		want := []byte{1, 3, 0, 86, 0, 2}
-		if string(modbus[:6]) != string(want) || !validCRC(modbus) {
-			done <- errors.New("request has wrong Modbus payload")
-			return
-		}
+		for request := range 2 {
+			frame, err := readFrame(conn)
+			if err != nil {
+				done <- err
+				return
+			}
+			if got := binary.LittleEndian.Uint32(frame[7:11]); got != serial {
+				done <- errors.New("request has wrong logger serial")
+				return
+			}
+			modbus := frame[26 : len(frame)-2]
+			want := []byte{1, 3, 0, 86, 0, 2}
+			if string(modbus[:6]) != string(want) || !validCRC(modbus) {
+				done <- errors.New("request has wrong Modbus payload")
+				return
+			}
 
-		response := []byte{1, 3, 4, 0, 0, 2, 48}
-		response = append(response, crc(response)...)
-		response = append(response, 0, 0)
-		if _, err := conn.Write(responseFrame(serial, frame[5]+1, response)); err != nil {
-			done <- err
-			return
+			response := []byte{1, 3, 4, 0, 0, 2, 48}
+			response = append(response, crc(response)...)
+			response = append(response, 0, 0)
+			if request == 0 {
+				if _, err := conn.Write(responseFrame(serial, frame[5]+1, response)); err != nil {
+					done <- err
+					return
+				}
+			}
+			if _, err := conn.Write(responseFrame(serial, frame[5], response)); err != nil {
+				done <- err
+				return
+			}
 		}
-		_, err = conn.Write(responseFrame(serial, frame[5], response))
-		done <- err
+		done <- nil
 	}()
 
 	host, port, err := net.SplitHostPort(listener.Addr().String())
@@ -71,19 +78,88 @@ func TestReadHoldingRegisters(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer client.Close()
 
-	value, err := client.ReadHoldingRegisters(context.Background(), 1, 86, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := []byte{0, 0, 2, 48}; string(value) != string(want) {
-		t.Fatalf("value: got %x, want %x", value, want)
+	for range 2 {
+		value, err := client.ReadHoldingRegisters(context.Background(), 1, 86, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []byte{0, 0, 2, 48}; string(value) != string(want) {
+			t.Fatalf("value: got %x, want %x", value, want)
+		}
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if len(messages) != 3 || !strings.HasPrefix(messages[0], "send ") || !strings.HasPrefix(messages[1], "recv ") || !strings.HasPrefix(messages[2], "recv ") {
+	if len(messages) != 5 || !strings.HasPrefix(messages[0], "send ") || !strings.HasPrefix(messages[1], "recv ") || !strings.HasPrefix(messages[2], "recv ") || !strings.HasPrefix(messages[3], "send ") || !strings.HasPrefix(messages[4], "recv ") {
 		t.Fatalf("unexpected log messages: %v", messages)
+	}
+}
+
+func TestReadHoldingRegistersReconnects(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	const serial = 3875738533
+	done := make(chan error, 1)
+	go func() {
+		for connection := range 2 {
+			conn, err := listener.Accept()
+			if err != nil {
+				done <- err
+				return
+			}
+
+			frame, err := readFrame(conn)
+			if err != nil {
+				_ = conn.Close()
+				done <- err
+				return
+			}
+			response := []byte{1, 3, 4, 0, 0, 2, 48}
+			response = append(response, crc(response)...)
+			response = append(response, 0, 0)
+			_, err = conn.Write(responseFrame(serial, frame[5], response))
+			_ = conn.Close()
+			if err != nil {
+				done <- err
+				return
+			}
+			if connection == 0 {
+				continue
+			}
+			done <- nil
+			return
+		}
+	}()
+
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	portNumber, err := net.LookupPort("tcp", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := New(host, portNumber, serial, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	if _, err := client.ReadHoldingRegisters(context.Background(), 1, 86, 2); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.ReadHoldingRegisters(context.Background(), 1, 86, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
 	}
 }
 
