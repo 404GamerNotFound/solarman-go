@@ -38,6 +38,16 @@ type Client struct {
 // Logger logs Solarman V5 transport messages.
 type Logger func(format string, args ...any)
 
+// ModbusExceptionError is returned when the inverter responds with a Modbus exception.
+type ModbusExceptionError struct {
+	// Code is the Modbus exception code returned by the inverter.
+	Code byte
+}
+
+func (e *ModbusExceptionError) Error() string {
+	return fmt.Sprintf("modbus exception: %d", e.Code)
+}
+
 // Option configures a Client.
 type Option func(*Client)
 
@@ -56,6 +66,9 @@ func New(host string, port int, serial uint32, timeout time.Duration, options ..
 	if port < 1 || port > 65535 {
 		return nil, fmt.Errorf("invalid port: %d", port)
 	}
+	if serial == 0 {
+		return nil, errors.New("missing logger serial")
+	}
 	if timeout <= 0 {
 		return nil, errors.New("invalid timeout")
 	}
@@ -72,7 +85,9 @@ func New(host string, port int, serial uint32, timeout time.Duration, options ..
 		sequence: sequence[0],
 	}
 	for _, option := range options {
-		option(client)
+		if option != nil {
+			option(client)
+		}
 	}
 
 	return client, nil
@@ -89,9 +104,6 @@ func (c *Client) ReadInputRegisters(ctx context.Context, id byte, address, count
 }
 
 func (c *Client) readRegisters(ctx context.Context, id, function byte, address, count uint16) ([]byte, error) {
-	if c.serial == 0 {
-		return nil, errors.New("missing logger serial")
-	}
 	if count == 0 || count > 125 {
 		return nil, fmt.Errorf("invalid register count: %d", count)
 	}
@@ -107,6 +119,10 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 	response, err := c.read(ctx, conn, id, function, address, count)
 	if err == nil {
 		return response, err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = c.close()
+		return nil, err
 	}
 
 	var transportErr *transportError
@@ -124,7 +140,15 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 		return nil, err
 	}
 
-	return c.read(ctx, conn, id, function, address, count)
+	response, err = c.read(ctx, conn, id, function, address, count)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			_ = c.close()
+			return nil, ctxErr
+		}
+	}
+
+	return response, err
 }
 
 func (c *Client) connection(ctx context.Context) (net.Conn, bool, error) {
@@ -150,6 +174,16 @@ func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, add
 	if err := conn.SetDeadline(deadline); err != nil {
 		return nil, &transportError{err: fmt.Errorf("set deadline: %w", err)}
 	}
+	cancelDone := make(chan struct{})
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+		close(cancelDone)
+	})
+	defer func() {
+		if !stopCancel() {
+			<-cancelDone
+		}
+	}()
 
 	sequence := c.sequence
 	c.sequence++
@@ -157,12 +191,18 @@ func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, add
 	request := request(c.serial, sequence, id, function, address, count)
 	c.logf("send %s: %x", c.address, request)
 	if _, err := conn.Write(request); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, &transportError{err: ctxErr}
+		}
 		return nil, &transportError{err: fmt.Errorf("write request: %w", err)}
 	}
 
 	for {
 		frame, err := readFrame(conn)
 		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, &transportError{err: ctxErr}
+			}
 			return nil, &transportError{err: fmt.Errorf("read response: %w", err)}
 		}
 		c.logf("recv %s: %x", c.address, frame)
@@ -297,7 +337,7 @@ func validateModbusResponse(response []byte, id, function byte, count uint16) ([
 		return nil, fmt.Errorf("unexpected modbus id: %d", response[0])
 	}
 	if response[1] == function|0x80 {
-		return nil, fmt.Errorf("modbus exception: %d", response[2])
+		return nil, &ModbusExceptionError{Code: response[2]}
 	}
 	if response[1] != function {
 		return nil, fmt.Errorf("unexpected modbus function: %d", response[1])
