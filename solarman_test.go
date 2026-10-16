@@ -59,7 +59,7 @@ func TestReadHoldingRegistersReusesConnection(t *testing.T) {
 		defer conn.Close()
 
 		for request := range 2 {
-			frame, err := readFrame(conn)
+			frame, _, err := readFrame(conn)
 			if err != nil {
 				done <- err
 				return
@@ -144,7 +144,7 @@ func TestReadInputRegisters(t *testing.T) {
 		}
 		defer conn.Close()
 
-		frame, err := readFrame(conn)
+		frame, _, err := readFrame(conn)
 		if err != nil {
 			done <- err
 			return
@@ -208,7 +208,7 @@ func TestReadHoldingRegistersReconnects(t *testing.T) {
 				return
 			}
 
-			frame, err := readFrame(conn)
+			frame, _, err := readFrame(conn)
 			if err != nil {
 				_ = conn.Close()
 				done <- err
@@ -274,7 +274,7 @@ func TestReadRegistersHonorsContextCancellation(t *testing.T) {
 		}
 		defer conn.Close()
 
-		if _, err := readFrame(conn); err != nil {
+		if _, _, err := readFrame(conn); err != nil {
 			done <- err
 			return
 		}
@@ -369,4 +369,91 @@ func responseFrame(serial uint32, sequence byte, modbus []byte) []byte {
 	frame = append(frame, checksum(frame[1:]), endByte)
 
 	return frame
+}
+
+// TestReadSkipsNonV5Data replays a Deye micro inverter logger that sends an AT banner and
+// 0xAA frames around its V5 responses (issue #2)
+func TestReadSkipsNonV5Data(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	const serial = 3875738533
+	banner := []byte("AT+YZCMPVER=MW3_16U_5408_5.0C-S\r\n\r\n")
+	trailer := []byte{0xAA, 0x03, 0x06, 0xBF, 0xFD, 0x87, 0x12, 0x00, 0x01, 0x94, 0x28, 0xAA, 0x10, 0x03, 0xE8, 0x00, 0x14, 0x59, 0xAD}
+
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+
+		for request := range 2 {
+			frame, _, err := readFrame(conn)
+			if err != nil {
+				done <- err
+				return
+			}
+			response := []byte{1, 3, 4, 0x0b, 0xea, 0, 0}
+			response = append(response, crc(response)...)
+			response = append(response, 0, 0)
+			var data []byte
+			if request == 0 {
+				data = append(data, banner...)
+			}
+			data = append(data, responseFrame(serial, frame[5], response)...)
+			data = append(data, trailer...)
+			if _, err := conn.Write(data); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	portNumber, err := net.LookupPort("tcp", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var messages []string
+	client, err := New(host, portNumber, serial, time.Second, WithLogger(func(format string, args ...any) {
+		messages = append(messages, fmt.Sprintf(format, args...))
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	for range 2 {
+		value, err := client.ReadHoldingRegisters(context.Background(), 1, 86, 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := []byte{0x0b, 0xea, 0, 0}; string(value) != string(want) {
+			t.Fatalf("value: got %x, want %x", value, want)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+
+	var skips []string
+	for _, m := range messages {
+		if strings.HasPrefix(m, "skip ") {
+			skips = append(skips, m)
+		}
+	}
+	if len(skips) != 2 || !strings.HasSuffix(skips[0], fmt.Sprintf("%x", banner)) || !strings.HasSuffix(skips[1], fmt.Sprintf("%x", trailer)) {
+		t.Fatalf("unexpected skip messages: %v", skips)
+	}
 }
