@@ -198,7 +198,10 @@ func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, add
 	}
 
 	for {
-		frame, err := readFrame(conn)
+		frame, skipped, err := readFrame(conn)
+		if len(skipped) > 0 {
+			c.logf("skip %s: %x", c.address, skipped)
+		}
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return nil, &transportError{err: ctxErr}
@@ -274,27 +277,36 @@ func request(serial uint32, sequence, id, function byte, address, count uint16) 
 	return frame
 }
 
-func readFrame(r io.Reader) ([]byte, error) {
+// readFrame reads the next V5 frame. Bytes before its start byte are skipped and returned:
+// some loggers interleave an AT banner and non-V5 frames with their responses.
+func readFrame(r io.Reader) ([]byte, []byte, error) {
+	var skipped []byte
 	header := make([]byte, 3)
-	if _, err := io.ReadFull(r, header); err != nil {
-		return nil, err
+	for {
+		if _, err := io.ReadFull(r, header[:1]); err != nil {
+			return nil, skipped, err
+		}
+		if header[0] == startByte {
+			break
+		}
+		skipped = append(skipped, header[0])
 	}
-	if header[0] != startByte {
-		return nil, fmt.Errorf("invalid frame start: %02x", header[0])
+	if _, err := io.ReadFull(r, header[1:]); err != nil {
+		return nil, skipped, err
 	}
 
 	payloadLength := int(binary.LittleEndian.Uint16(header[1:]))
 	if payloadLength > maxFramePayloadLength {
-		return nil, fmt.Errorf("frame payload too large: %d", payloadLength)
+		return nil, skipped, fmt.Errorf("frame payload too large: %d", payloadLength)
 	}
 
 	frame := make([]byte, 3+payloadLength+10)
 	copy(frame, header)
 	if _, err := io.ReadFull(r, frame[3:]); err != nil {
-		return nil, err
+		return nil, skipped, err
 	}
 
-	return frame, nil
+	return frame, skipped, nil
 }
 
 func validateResponse(frame []byte, serial uint32, sequence byte) ([]byte, error) {
