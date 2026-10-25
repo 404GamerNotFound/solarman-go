@@ -2,6 +2,7 @@
 package solarman
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
@@ -23,7 +24,7 @@ const (
 	maxFramePayloadLength = 1024
 )
 
-// Client reads Modbus registers through a Solarman V5 logger.
+// Client reads and writes Modbus registers through a Solarman V5 logger.
 type Client struct {
 	address string
 	serial  uint32
@@ -103,11 +104,52 @@ func (c *Client) ReadInputRegisters(ctx context.Context, id byte, address, count
 	return c.readRegisters(ctx, id, 0x04, address, count)
 }
 
+// WriteSingleRegister writes a holding register of the connected inverter, Modbus function 0x06.
+func (c *Client) WriteSingleRegister(ctx context.Context, id byte, address, value uint16) error {
+	pdu := []byte{id, 0x06, byte(address >> 8), byte(address), byte(value >> 8), byte(value)}
+
+	response, err := c.transact(ctx, pdu)
+	if err != nil {
+		return err
+	}
+
+	return validateWriteResponse(response, pdu)
+}
+
+// WriteMultipleRegisters writes consecutive holding registers of the connected inverter, Modbus function 0x10.
+// Values holds two big-endian bytes per register.
+func (c *Client) WriteMultipleRegisters(ctx context.Context, id byte, address uint16, values []byte) error {
+	count := len(values) / 2
+	if len(values)%2 != 0 || count == 0 || count > 123 {
+		return fmt.Errorf("invalid register values length: %d", len(values))
+	}
+
+	pdu := []byte{id, 0x10, byte(address >> 8), byte(address), byte(count >> 8), byte(count), byte(len(values))}
+	pdu = append(pdu, values...)
+
+	response, err := c.transact(ctx, pdu)
+	if err != nil {
+		return err
+	}
+
+	return validateWriteResponse(response, pdu[:6])
+}
+
 func (c *Client) readRegisters(ctx context.Context, id, function byte, address, count uint16) ([]byte, error) {
 	if count == 0 || count > 125 {
 		return nil, fmt.Errorf("invalid register count: %d", count)
 	}
 
+	response, err := c.transact(ctx, []byte{id, function, byte(address >> 8), byte(address), byte(count >> 8), byte(count)})
+	if err != nil {
+		return nil, err
+	}
+
+	return validateModbusResponse(response, id, function, count)
+}
+
+// transact sends a Modbus request without CRC and returns the Modbus response of the matching V5 frame.
+func (c *Client) transact(ctx context.Context, pdu []byte) ([]byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -116,7 +158,7 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 		return nil, err
 	}
 
-	response, err := c.read(ctx, conn, id, function, address, count)
+	response, err := c.read(ctx, conn, pdu)
 	if err == nil {
 		return response, err
 	}
@@ -140,7 +182,7 @@ func (c *Client) readRegisters(ctx context.Context, id, function byte, address, 
 		return nil, err
 	}
 
-	response, err = c.read(ctx, conn, id, function, address, count)
+	response, err = c.read(ctx, conn, pdu)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			_ = c.close()
@@ -166,7 +208,7 @@ func (c *Client) connection(ctx context.Context) (net.Conn, bool, error) {
 	return conn, false, nil
 }
 
-func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, address, count uint16) ([]byte, error) {
+func (c *Client) read(ctx context.Context, conn net.Conn, pdu []byte) ([]byte, error) {
 	deadline := time.Now().Add(c.timeout)
 	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
 		deadline = contextDeadline
@@ -188,7 +230,7 @@ func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, add
 	sequence := c.sequence
 	c.sequence++
 
-	request := request(c.serial, sequence, id, function, address, count)
+	request := request(c.serial, sequence, pdu)
 	c.logf("send %s: %x", c.address, request)
 	if _, err := conn.Write(request); err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -213,12 +255,7 @@ func (c *Client) read(ctx context.Context, conn net.Conn, id, function byte, add
 			continue
 		}
 
-		response, err := validateResponse(frame, c.serial, sequence)
-		if err != nil {
-			return nil, err
-		}
-
-		return validateModbusResponse(response, id, function, count)
+		return validateResponse(frame, c.serial, sequence)
 	}
 }
 
@@ -259,9 +296,8 @@ func (c *Client) logf(format string, args ...any) {
 	}
 }
 
-func request(serial uint32, sequence, id, function byte, address, count uint16) []byte {
-	modbus := []byte{id, function, byte(address >> 8), byte(address), byte(count >> 8), byte(count)}
-	modbus = append(modbus, crc(modbus)...)
+func request(serial uint32, sequence byte, pdu []byte) []byte {
+	modbus := append(pdu[:len(pdu):len(pdu)], crc(pdu)...)
 
 	payload := make([]byte, 15, 15+len(modbus))
 	payload[0] = 0x02
@@ -336,6 +372,34 @@ func validateResponse(frame []byte, serial uint32, sequence byte) ([]byte, error
 }
 
 func validateModbusResponse(response []byte, id, function byte, count uint16) ([]byte, error) {
+	response, err := modbusResponse(response, id, function)
+	if err != nil {
+		return nil, err
+	}
+
+	byteCount := int(response[2])
+	if byteCount != int(count)*2 || len(response) != byteCount+3 {
+		return nil, fmt.Errorf("unexpected modbus response length: %d", byteCount)
+	}
+
+	return response[3:], nil
+}
+
+// validateWriteResponse checks that the inverter echoed the request header.
+func validateWriteResponse(response, echo []byte) error {
+	response, err := modbusResponse(response, echo[0], echo[1])
+	if err != nil {
+		return err
+	}
+	if !bytes.Equal(response, echo) {
+		return fmt.Errorf("unexpected modbus write response: %x", response)
+	}
+
+	return nil
+}
+
+// modbusResponse validates a Modbus RTU response and returns it without CRC.
+func modbusResponse(response []byte, id, function byte) ([]byte, error) {
 	if len(response) >= 2 && response[len(response)-1] == 0 && response[len(response)-2] == 0 && validCRC(response[:len(response)-2]) {
 		response = response[:len(response)-2]
 	}
@@ -355,12 +419,7 @@ func validateModbusResponse(response []byte, id, function byte, count uint16) ([
 		return nil, fmt.Errorf("unexpected modbus function: %d", response[1])
 	}
 
-	byteCount := int(response[2])
-	if byteCount != int(count)*2 || len(response) != byteCount+5 {
-		return nil, fmt.Errorf("unexpected modbus response length: %d", byteCount)
-	}
-
-	return response[3 : 3+byteCount], nil
+	return response[:len(response)-2], nil
 }
 
 func checksum(data []byte) byte {

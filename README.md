@@ -1,7 +1,7 @@
 # solarman-go
 
 `solarman-go` is a Go client for the local Solarman V5 TCP transport exposed by compatible data loggers, normally on port `8899`.
-It forwards Modbus RTU read requests through the logger to the connected inverter.
+It forwards Modbus RTU read and write requests through the logger to the connected inverter.
 
 The module implements transport only. Register maps, data types, scaling and value decoding are specific to the connected inverter and belong to the consumer.
 
@@ -59,14 +59,16 @@ func main() {
 
 - Read holding registers, Modbus function `0x03`
 - Read input registers, Modbus function `0x04`
+- Write single register, Modbus function `0x06`
+- Write multiple registers, Modbus function `0x10`
 
-The module is read-only. It does not implement write requests, coils or discrete inputs. A read request must contain between 1 and 125 registers.
+The module does not implement coils or discrete inputs. A read request must contain between 1 and 125 registers, a write request between 1 and 123. `WriteMultipleRegisters` takes two big-endian bytes per register. A write succeeds when the inverter echoes the request.
 
 ## Connections and timeouts
 
 A `Client` reuses its TCP connection for subsequent requests. Close it with `Close` when it is no longer needed. Calls on a client are serialized, so one client is safe to share between goroutines, although requests are processed one at a time.
 
-The timeout passed to `New` limits dialing and each transport operation. An earlier context deadline takes precedence. If a reused connection fails because of a transport error, the client closes it, reconnects and retries the request once.
+The timeout passed to `New` limits dialing and each transport operation. An earlier context deadline takes precedence. If a reused connection fails because of a transport error, the client closes it, reconnects and retries the request once. This also applies to writes, so only use them for registers where repeating a write is safe.
 
 ## Debug logging
 
@@ -74,7 +76,7 @@ Pass `solarman.WithLogger(log.Printf)` to `New` to log sent and received Solarma
 
 ## Errors
 
-`New` validates the host, TCP port, logger serial number and timeout. Read methods validate the register count. Errors from the network, context deadline, protocol framing and Modbus response are returned to the caller with context. Modbus exception responses can be inspected with `errors.As` and `*solarman.ModbusExceptionError`.
+`New` validates the host, TCP port, logger serial number and timeout. Read and write methods validate the register count. Errors from the network, context deadline, protocol framing and Modbus response are returned to the caller with context. Modbus exception responses can be inspected with `errors.As` and `*solarman.ModbusExceptionError`.
 
 ## License
 

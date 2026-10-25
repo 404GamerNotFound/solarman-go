@@ -1,6 +1,7 @@
 package solarman
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -330,6 +331,109 @@ func TestReadRegistersHonorsContextCancellation(t *testing.T) {
 	}
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestWriteRegisters(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	const serial = 3875738533
+	requests := [][]byte{
+		{3, 6, 0, 18, 0x10, 0x2c},
+		{3, 0x10, 0, 18, 0, 2, 4, 0x10, 0x2c, 0, 1},
+		{3, 6, 0, 18, 0, 0},
+	}
+	responses := [][]byte{
+		{3, 6, 0, 18, 0x10, 0x2c},
+		{3, 0x10, 0, 18, 0, 2},
+		{3, 0x86, 2},
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			done <- err
+			return
+		}
+		defer conn.Close()
+
+		for i, want := range requests {
+			frame, _, err := readFrame(conn)
+			if err != nil {
+				done <- err
+				return
+			}
+			modbus := frame[26 : len(frame)-2]
+			if !bytes.Equal(modbus[:len(modbus)-2], want) || !validCRC(modbus) {
+				done <- fmt.Errorf("request %d: got %x, want %x", i, modbus, want)
+				return
+			}
+
+			response := append(responses[i], crc(responses[i])...)
+			if _, err := conn.Write(responseFrame(serial, frame[5], response)); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+
+	host, port, err := net.SplitHostPort(listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	portNumber, err := net.LookupPort("tcp", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, err := New(host, portNumber, serial, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	ctx := context.Background()
+	if err := client.WriteSingleRegister(ctx, 3, 18, 4140); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.WriteMultipleRegisters(ctx, 3, 18, []byte{0x10, 0x2c, 0, 1}); err != nil {
+		t.Fatal(err)
+	}
+	var exception *ModbusExceptionError
+	if err := client.WriteSingleRegister(ctx, 3, 18, 0); !errors.As(err, &exception) || exception.Code != 2 {
+		t.Fatalf("error: got %v, want ModbusExceptionError 2", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWriteMultipleRegistersValidatesValues(t *testing.T) {
+	client, err := New("localhost", 8899, 1, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	for _, values := range [][]byte{nil, {1}, make([]byte, 248)} {
+		if err := client.WriteMultipleRegisters(context.Background(), 1, 0, values); err == nil {
+			t.Fatalf("expected validation error for %d bytes", len(values))
+		}
+	}
+}
+
+func TestValidateWriteResponseEcho(t *testing.T) {
+	response := []byte{3, 6, 0, 18, 0, 1}
+	response = append(response, crc(response)...)
+
+	if err := validateWriteResponse(response, []byte{3, 6, 0, 18, 0, 2}); err == nil {
+		t.Fatal("expected echo mismatch error")
 	}
 }
 
